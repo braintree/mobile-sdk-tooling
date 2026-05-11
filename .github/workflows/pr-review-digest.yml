@@ -24,7 +24,11 @@ jobs:
           # Scopes the token to the whole org so it can read any repo with our GH app installed.
           owner: ${{ github.repository_owner }}
 
-      # ── Step 2: Find PRs needing review and post digest to Slack ───────────
+      # ── Step 2: Check out this repo to read its CODEOWNERS file ───────────
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      # ── Step 3: Find PRs needing review and post digest to Slack ───────────
       - name: Find PRs needing review and post to Slack
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -41,6 +45,21 @@ jobs:
           SLACK_BODY=""
           NL=$'\n'
           
+          # ── Read code owners from this repo's CODEOWNERS file ─────────────
+          # Extracts individual @username entries only — @org/team refs are skipped
+          # since we're matching against individual reviewer logins on PRs.
+          CODE_OWNERS=""
+          for CO_PATH in ".github/CODEOWNERS" "CODEOWNERS" "docs/CODEOWNERS"; do
+            if [[ -f "$CO_PATH" ]]; then
+              CODE_OWNERS=$(grep -v '^\s*#' "$CO_PATH" \
+                | grep -oP '(?<=@)[a-zA-Z0-9][a-zA-Z0-9_-]*(?!\/)' \
+                | sort -u | tr '\n' ' ')
+              echo "CODEOWNERS loaded from ${CO_PATH}: ${CODE_OWNERS}"
+              break
+            fi
+          done
+          [[ -z "$CODE_OWNERS" ]] && echo "No CODEOWNERS file found — all reviews will count"
+          
           if [[ -z "$REPOS" ]]; then
             echo "REPOS variable is empty — Please set it to a comma-separated list of repositories (e.g. 'org/repo1, org/repo2') in Actions Variables."
             exit 0
@@ -53,7 +72,6 @@ jobs:
             [[ -z "$REPO" ]] && continue
             echo "Scanning: $REPO"
           
-            # Fetch all open PRs with the fields we need.
             # latestReviews   = most recent review state per reviewer
             # mergeStateStatus= CLEAN means approved, checks pass, no conflicts
             # updatedAt       = last time the PR was updated (push, comment, review, etc.)
@@ -91,34 +109,52 @@ jobs:
                 AGE_LABEL="$((AGE_HOURS / 24))d"
               fi
           
-              REVIEW_COUNT=$(echo "$PR" | jq '.latestReviews | length')
+              # ── Filter reviews to code owners only ──────────────────────
+              if [[ -n "$CODE_OWNERS" ]]; then
+                REVIEW_COUNT=$(echo "$PR" | jq --arg owners "$CODE_OWNERS" '
+                  ($owners | split(" ") | map(select(length > 0))) as $owner_list |
+                  [.latestReviews[] |
+                    select(.author.login as $l | $owner_list | contains([$l]))] | length
+                ')
+                APPROVERS=$(echo "$PR" | jq -r --arg owners "$CODE_OWNERS" '
+                  ($owners | split(" ") | map(select(length > 0))) as $owner_list |
+                  [.latestReviews[] |
+                    select(.state == "APPROVED") |
+                    select(.author.login as $l | $owner_list | contains([$l])) |
+                    .author.login] | join(", ")
+                ')
+              else
+                # No CODEOWNERS — count all reviews
+                REVIEW_COUNT=$(echo "$PR" | jq '.latestReviews | length')
+                APPROVERS=$(echo "$PR" | jq -r \
+                  '[.latestReviews[] | select(.state == "APPROVED") | .author.login] | join(", ")')
+              fi
+          
               MERGE_STATE=$(echo "$PR" | jq -r '.mergeStateStatus')
           
               REASONS=()
           
-              # ── Criterion 1: fewer than 2 reviews ──────────────────────
+              # ── Criterion 1: fewer than 2 code owner reviews ───────────
               if [[ $REVIEW_COUNT -lt 2 ]]; then
                 NEEDED=$(( 2 - REVIEW_COUNT ))
-                REASONS+=("${REVIEW_COUNT}/2 reviews — needs ${NEEDED} more")
+                REASONS+=("${REVIEW_COUNT}/2 code owner reviews — needs ${NEEDED} more")
               fi
           
               # ── Criterion 2: ready to merge ─────────────────────────────
-              # CLEAN = approved, all checks pass, no conflicts
               if [[ "$MERGE_STATE" == "CLEAN" ]]; then
                 REASONS+=("ready to merge")
               fi
           
-              # ── Criterion 3: 2+ reviews but no activity for >12 hours ──
+              # ── Criterion 3: 2+ code owner reviews but stale ───────────
               if [[ $REVIEW_COUNT -ge 2 && $STALE_HOURS -ge $THRESHOLD ]]; then
                 if [[ $STALE_HOURS -lt 24 ]]; then
                   STALE_LABEL="${STALE_HOURS}h"
                 else
                   STALE_LABEL="$((STALE_HOURS / 24))d"
                 fi
-                REASONS+=("${REVIEW_COUNT} reviews but no activity for ${STALE_LABEL}")
+                REASONS+=("${REVIEW_COUNT} code owner reviews but no activity for ${STALE_LABEL}")
               fi
           
-              # Only surface this PR if at least one criterion matches
               [[ ${#REASONS[@]} -eq 0 ]] && continue
           
               REASON_STR=$(printf '%s; ' "${REASONS[@]}")
@@ -133,8 +169,6 @@ jobs:
               fi
           
               # Approvers
-              APPROVERS=$(echo "$PR" | jq -r \
-                '[.latestReviews[] | select(.state == "APPROVED") | .author.login] | join(", ")')
               if [[ -n "$APPROVERS" ]]; then
                 APPROVAL_STR="${NL}  ✅ Approved by: $APPROVERS"
               else
