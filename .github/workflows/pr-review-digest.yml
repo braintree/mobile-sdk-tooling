@@ -41,9 +41,20 @@ jobs:
           
           THRESHOLD="${OPEN_THRESHOLD_HOURS:-12}"
           NOW=$(date +%s)
+          NL=$'\n'
+          
+          # Regular PR tracking
           TOTAL=0
           SLACK_BODY=""
-          NL=$'\n'
+          
+          # Inner source PR tracking (only included on Tuesdays and Thursdays)
+          INNER_SOURCE_TOTAL=0
+          INNER_SOURCE_BODY=""
+          
+          # 1=Mon, 2=Tue, 3=Wed, 4=Thu, 5=Fri
+          DAY_OF_WEEK=$(date '+%u')
+          IS_INNER_SOURCE_DAY=false
+          [[ $DAY_OF_WEEK -eq 2 || $DAY_OF_WEEK -eq 4 ]] && IS_INNER_SOURCE_DAY=true
           
           # ── Read code owners from this repo's CODEOWNERS file ─────────────
           # Extracts individual @username entries only — @org/team refs are skipped
@@ -83,6 +94,7 @@ jobs:
           
             PR_COUNT=$(echo "$PRS" | jq 'length')
             REPO_TEXT=""
+            INNER_SOURCE_REPO_TEXT=""
           
             for i in $(seq 0 $((PR_COUNT - 1))); do
               PR=$(echo "$PRS" | jq ".[$i]")
@@ -107,6 +119,15 @@ jobs:
                 AGE_LABEL="${AGE_HOURS}h"
               else
                 AGE_LABEL="$((AGE_HOURS / 24))d"
+              fi
+          
+              # ── Check for inner source label (case-insensitive) ─────────
+              IS_INNER_SOURCE=$(echo "$PR" | jq -r \
+                '[.labels[].name | ascii_downcase] | contains(["inner source"])')
+          
+              # Skip inner source PRs on non-Tue/Thu days entirely
+              if [[ "$IS_INNER_SOURCE" == "true" && "$IS_INNER_SOURCE_DAY" == "false" ]]; then
+                continue
               fi
           
               # ── Filter reviews to code owners only ──────────────────────
@@ -160,7 +181,7 @@ jobs:
               REASON_STR=$(printf '%s; ' "${REASONS[@]}")
               REASON_STR="${REASON_STR%; }"   # strip trailing semicolon
           
-              # Labels
+              # Labels (display all labels except "inner source" which drives section routing)
               LABELS=$(echo "$PR" | jq -r '[.labels[].name] | join(", ")')
               if [[ -n "$LABELS" ]]; then
                 LABEL_STR="${NL}  🏷️  ${LABELS}"
@@ -175,22 +196,40 @@ jobs:
                 APPROVAL_STR=""
               fi
           
-              REPO_TEXT+="• <${URL}|#${NUMBER}: ${TITLE}> — @${AUTHOR} · ${AGE_LABEL} old${NL}  ${REASON_STR}${LABEL_STR}${APPROVAL_STR}${NL}"
-              ((TOTAL++)) || true
+              PR_LINE="• <${URL}|#${NUMBER}: ${TITLE}> — @${AUTHOR} · ${AGE_LABEL} old${NL}  ${REASON_STR}${LABEL_STR}${APPROVAL_STR}${NL}"
+          
+              # ── Route PR to the appropriate section ─────────────────────
+              if [[ "$IS_INNER_SOURCE" == "true" ]]; then
+                INNER_SOURCE_REPO_TEXT+="$PR_LINE"
+                ((INNER_SOURCE_TOTAL++)) || true
+              else
+                REPO_TEXT+="$PR_LINE"
+                ((TOTAL++)) || true
+              fi
             done
           
             if [[ -n "$REPO_TEXT" ]]; then
               SLACK_BODY+="${REPO}${NL}${REPO_TEXT}${NL}"
             fi
+            if [[ -n "$INNER_SOURCE_REPO_TEXT" ]]; then
+              INNER_SOURCE_BODY+="${REPO}${NL}${INNER_SOURCE_REPO_TEXT}${NL}"
+            fi
           done
           
           # ── Build and send Slack message ──────────────────────────────────
           DATE_LABEL=$(date '+%A, %B %-d')
+          SLACK_TEXT=""
           
-          if [[ $TOTAL -eq 0 ]]; then
+          if [[ $TOTAL -gt 0 ]]; then
+            SLACK_TEXT+="🔍 PR Review Digest — ${DATE_LABEL}${NL}${TOTAL} PR(s) need attention:${NL}${NL}${SLACK_BODY}"
+          fi
+          
+          if [[ $INNER_SOURCE_TOTAL -gt 0 ]]; then
+            SLACK_TEXT+="${NL}🌐 Inner Source PRs — ${DATE_LABEL}${NL}${INNER_SOURCE_TOTAL} inner source PR(s) need attention:${NL}${NL}${INNER_SOURCE_BODY}"
+          fi
+          
+          if [[ -z "$SLACK_TEXT" ]]; then
             SLACK_TEXT="✅ PR Review Digest — ${DATE_LABEL} — All clear! There are no PRs currently needing attention."
-          else
-            SLACK_TEXT="🔍 PR Review Digest — ${DATE_LABEL}${NL}${TOTAL} PR(s) need attention:${NL}${NL}${SLACK_BODY}"
           fi
           
           # Slack Workflow expects a variable named "message" in the payload.
@@ -201,4 +240,4 @@ jobs:
             --data "$PAYLOAD" \
             "$SLACK_WEBHOOK_URL" > /dev/null
           
-          echo "Done. Posted $TOTAL PR(s) to Slack."
+          echo "Done. Posted $TOTAL regular PR(s) and $INNER_SOURCE_TOTAL inner source PR(s) to Slack."
