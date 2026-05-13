@@ -24,7 +24,11 @@ jobs:
           # Scopes the token to the whole org so it can read any repo with our GH app installed.
           owner: ${{ github.repository_owner }}
 
-      # ── Step 2: Find PRs needing review and post digest to Slack ───────────
+      # ── Step 2: Check out this repo to read its CODEOWNERS file ───────────
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      # ── Step 3: Find PRs needing review and post digest to Slack ───────────
       - name: Find PRs needing review and post to Slack
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -37,9 +41,35 @@ jobs:
           
           THRESHOLD="${OPEN_THRESHOLD_HOURS:-12}"
           NOW=$(date +%s)
+          NL=$'\n'
+          
+          # Regular PR tracking
           TOTAL=0
           SLACK_BODY=""
-          NL=$'\n'
+          
+          # Inner source PR tracking (only included on Tuesdays and Thursdays)
+          INNER_SOURCE_TOTAL=0
+          INNER_SOURCE_BODY=""
+          
+          # 1=Mon, 2=Tue, 3=Wed, 4=Thu, 5=Fri
+          DAY_OF_WEEK=$(date '+%u')
+          IS_INNER_SOURCE_DAY=false
+          [[ $DAY_OF_WEEK -eq 2 || $DAY_OF_WEEK -eq 4 ]] && IS_INNER_SOURCE_DAY=true
+          
+          # ── Read code owners from this repo's CODEOWNERS file ─────────────
+          # Extracts individual @username entries only — @org/team refs are skipped
+          # since we're matching against individual reviewer logins on PRs.
+          CODE_OWNERS=""
+          for CO_PATH in ".github/CODEOWNERS" "CODEOWNERS" "docs/CODEOWNERS"; do
+            if [[ -f "$CO_PATH" ]]; then
+              CODE_OWNERS=$(grep -v '^\s*#' "$CO_PATH" \
+                | grep -oP '(?<=@)[a-zA-Z0-9][a-zA-Z0-9_-]*(?!\/)' \
+                | sort -u | tr '\n' ' ')
+              echo "CODEOWNERS loaded from ${CO_PATH}: ${CODE_OWNERS}"
+              break
+            fi
+          done
+          [[ -z "$CODE_OWNERS" ]] && echo "No CODEOWNERS file found — all reviews will count"
           
           if [[ -z "$REPOS" ]]; then
             echo "REPOS variable is empty — Please set it to a comma-separated list of repositories (e.g. 'org/repo1, org/repo2') in Actions Variables."
@@ -53,7 +83,6 @@ jobs:
             [[ -z "$REPO" ]] && continue
             echo "Scanning: $REPO"
           
-            # Fetch all open PRs with the fields we need.
             # latestReviews   = most recent review state per reviewer
             # mergeStateStatus= CLEAN means approved, checks pass, no conflicts
             # updatedAt       = last time the PR was updated (push, comment, review, etc.)
@@ -65,6 +94,7 @@ jobs:
           
             PR_COUNT=$(echo "$PRS" | jq 'length')
             REPO_TEXT=""
+            INNER_SOURCE_REPO_TEXT=""
           
             for i in $(seq 0 $((PR_COUNT - 1))); do
               PR=$(echo "$PRS" | jq ".[$i]")
@@ -91,40 +121,67 @@ jobs:
                 AGE_LABEL="$((AGE_HOURS / 24))d"
               fi
           
-              REVIEW_COUNT=$(echo "$PR" | jq '.latestReviews | length')
+              # ── Check for inner source label (case-insensitive) ─────────
+              IS_INNER_SOURCE=$(echo "$PR" | jq -r \
+                '[.labels[].name | ascii_downcase] | contains(["inner source"])')
+          
+              # Skip inner source PRs on non-Tue/Thu days entirely
+              if [[ "$IS_INNER_SOURCE" == "true" && "$IS_INNER_SOURCE_DAY" == "false" ]]; then
+                continue
+              fi
+          
+              # ── Filter reviews to code owners only ──────────────────────
+              if [[ -n "$CODE_OWNERS" ]]; then
+                REVIEW_COUNT=$(echo "$PR" | jq --arg owners "$CODE_OWNERS" '
+                  ($owners | split(" ") | map(select(length > 0))) as $owner_list |
+                  [.latestReviews[] |
+                    select(.author.login as $l | $owner_list | contains([$l]))] | length
+                ')
+                APPROVERS=$(echo "$PR" | jq -r --arg owners "$CODE_OWNERS" '
+                  ($owners | split(" ") | map(select(length > 0))) as $owner_list |
+                  [.latestReviews[] |
+                    select(.state == "APPROVED") |
+                    select(.author.login as $l | $owner_list | contains([$l])) |
+                    .author.login] | join(", ")
+                ')
+              else
+                # No CODEOWNERS — count all reviews
+                REVIEW_COUNT=$(echo "$PR" | jq '.latestReviews | length')
+                APPROVERS=$(echo "$PR" | jq -r \
+                  '[.latestReviews[] | select(.state == "APPROVED") | .author.login] | join(", ")')
+              fi
+          
               MERGE_STATE=$(echo "$PR" | jq -r '.mergeStateStatus')
           
               REASONS=()
           
-              # ── Criterion 1: fewer than 2 reviews ──────────────────────
+              # ── Criterion 1: fewer than 2 code owner reviews ───────────
               if [[ $REVIEW_COUNT -lt 2 ]]; then
                 NEEDED=$(( 2 - REVIEW_COUNT ))
-                REASONS+=("${REVIEW_COUNT}/2 reviews — needs ${NEEDED} more")
+                REASONS+=("${REVIEW_COUNT}/2 code owner reviews — needs ${NEEDED} more")
               fi
           
               # ── Criterion 2: ready to merge ─────────────────────────────
-              # CLEAN = approved, all checks pass, no conflicts
               if [[ "$MERGE_STATE" == "CLEAN" ]]; then
                 REASONS+=("ready to merge")
               fi
           
-              # ── Criterion 3: 2+ reviews but no activity for >12 hours ──
+              # ── Criterion 3: 2+ code owner reviews but stale ───────────
               if [[ $REVIEW_COUNT -ge 2 && $STALE_HOURS -ge $THRESHOLD ]]; then
                 if [[ $STALE_HOURS -lt 24 ]]; then
                   STALE_LABEL="${STALE_HOURS}h"
                 else
                   STALE_LABEL="$((STALE_HOURS / 24))d"
                 fi
-                REASONS+=("${REVIEW_COUNT} reviews but no activity for ${STALE_LABEL}")
+                REASONS+=("${REVIEW_COUNT} code owner reviews but no activity for ${STALE_LABEL}")
               fi
           
-              # Only surface this PR if at least one criterion matches
               [[ ${#REASONS[@]} -eq 0 ]] && continue
           
               REASON_STR=$(printf '%s; ' "${REASONS[@]}")
               REASON_STR="${REASON_STR%; }"   # strip trailing semicolon
           
-              # Labels
+              # Labels (display all labels except "inner source" which drives section routing)
               LABELS=$(echo "$PR" | jq -r '[.labels[].name] | join(", ")')
               if [[ -n "$LABELS" ]]; then
                 LABEL_STR="${NL}  🏷️  ${LABELS}"
@@ -133,30 +190,46 @@ jobs:
               fi
           
               # Approvers
-              APPROVERS=$(echo "$PR" | jq -r \
-                '[.latestReviews[] | select(.state == "APPROVED") | .author.login] | join(", ")')
               if [[ -n "$APPROVERS" ]]; then
                 APPROVAL_STR="${NL}  ✅ Approved by: $APPROVERS"
               else
                 APPROVAL_STR=""
               fi
           
-              REPO_TEXT+="• <${URL}|#${NUMBER}: ${TITLE}> — @${AUTHOR} · ${AGE_LABEL} old${NL}  ${REASON_STR}${LABEL_STR}${APPROVAL_STR}${NL}"
-              ((TOTAL++)) || true
+              PR_LINE="• <${URL}|#${NUMBER}: ${TITLE}> — @${AUTHOR} · ${AGE_LABEL} old${NL}  ${REASON_STR}${LABEL_STR}${APPROVAL_STR}${NL}"
+          
+              # ── Route PR to the appropriate section ─────────────────────
+              if [[ "$IS_INNER_SOURCE" == "true" ]]; then
+                INNER_SOURCE_REPO_TEXT+="$PR_LINE"
+                ((INNER_SOURCE_TOTAL++)) || true
+              else
+                REPO_TEXT+="$PR_LINE"
+                ((TOTAL++)) || true
+              fi
             done
           
             if [[ -n "$REPO_TEXT" ]]; then
               SLACK_BODY+="${REPO}${NL}${REPO_TEXT}${NL}"
             fi
+            if [[ -n "$INNER_SOURCE_REPO_TEXT" ]]; then
+              INNER_SOURCE_BODY+="${REPO}${NL}${INNER_SOURCE_REPO_TEXT}${NL}"
+            fi
           done
           
           # ── Build and send Slack message ──────────────────────────────────
           DATE_LABEL=$(date '+%A, %B %-d')
+          SLACK_TEXT=""
           
-          if [[ $TOTAL -eq 0 ]]; then
+          if [[ $TOTAL -gt 0 ]]; then
+            SLACK_TEXT+="🔍 PR Review Digest — ${DATE_LABEL}${NL}${TOTAL} PR(s) need attention:${NL}${NL}${SLACK_BODY}"
+          fi
+          
+          if [[ $INNER_SOURCE_TOTAL -gt 0 ]]; then
+            SLACK_TEXT+="${NL}🌐 Inner Source PRs — ${DATE_LABEL}${NL}${INNER_SOURCE_TOTAL} inner source PR(s) need attention:${NL}${NL}${INNER_SOURCE_BODY}"
+          fi
+          
+          if [[ -z "$SLACK_TEXT" ]]; then
             SLACK_TEXT="✅ PR Review Digest — ${DATE_LABEL} — All clear! There are no PRs currently needing attention."
-          else
-            SLACK_TEXT="🔍 PR Review Digest — ${DATE_LABEL}${NL}${TOTAL} PR(s) need attention:${NL}${NL}${SLACK_BODY}"
           fi
           
           # Slack Workflow expects a variable named "message" in the payload.
@@ -167,4 +240,4 @@ jobs:
             --data "$PAYLOAD" \
             "$SLACK_WEBHOOK_URL" > /dev/null
           
-          echo "Done. Posted $TOTAL PR(s) to Slack."
+          echo "Done. Posted $TOTAL regular PR(s) and $INNER_SOURCE_TOTAL inner source PR(s) to Slack."
