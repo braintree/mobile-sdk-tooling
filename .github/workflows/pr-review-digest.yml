@@ -104,7 +104,7 @@ jobs:
               [[ "$IS_DRAFT" == "true" ]] && continue
           
               NUMBER=$(echo "$PR"  | jq -r '.number')
-              TITLE=$(echo "$PR"   | jq -r '.title' | sed 's/[|>]/ /g')
+              TITLE=$(echo "$PR"   | jq -r '.title' | sed 's/[][|>]/ /g')
               URL=$(echo "$PR"     | jq -r '.url')
               AUTHOR=$(echo "$PR"  | jq -r '.author.login')
               CREATED=$(echo "$PR" | jq -r '.createdAt')
@@ -196,7 +196,7 @@ jobs:
                 APPROVAL_STR=""
               fi
           
-              PR_LINE="• <${URL}|#${NUMBER}: ${TITLE}> — @${AUTHOR} · ${AGE_LABEL} old${NL}  ${REASON_STR}${LABEL_STR}${APPROVAL_STR}${NL}"
+              PR_LINE="• [#${NUMBER}: ${TITLE}](${URL}) — @${AUTHOR} · ${AGE_LABEL} old${NL}  ${REASON_STR}${LABEL_STR}${APPROVAL_STR}${NL}"
           
               # ── Route PR to the appropriate section ─────────────────────
               if [[ "$IS_INNER_SOURCE" == "true" ]]; then
