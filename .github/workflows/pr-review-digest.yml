@@ -90,7 +90,7 @@ jobs:
               --repo "$REPO" \
               --state open \
               --limit 100 \
-              --json number,title,url,author,createdAt,updatedAt,isDraft,latestReviews,mergeStateStatus,labels,commits)
+              --json number,title,url,author,createdAt,updatedAt,isDraft,latestReviews,mergeStateStatus,labels)
           
             PR_COUNT=$(echo "$PRS" | jq 'length')
             REPO_TEXT=""
@@ -109,9 +109,6 @@ jobs:
               AUTHOR=$(echo "$PR"  | jq -r '.author.login')
               CREATED=$(echo "$PR" | jq -r '.createdAt')
               UPDATED=$(echo "$PR" | jq -r '.updatedAt')
-              # Most recent commit date on the PR — used to tell whether a CHANGES_REQUESTED
-              # review has since been addressed by a new push.
-              LAST_COMMIT_DATE=$(echo "$PR" | jq -r '[.commits[].committedDate] | max // ""')
           
               CREATED_EPOCH=$(date -d "$CREATED" +%s)
               UPDATED_EPOCH=$(date -d "$UPDATED" +%s)
@@ -134,20 +131,29 @@ jobs:
               fi
           
               # ── Skip PRs with unaddressed change requests ───────────────
-              # If a reviewer's latest review is CHANGES_REQUESTED (limited to code owners when a
-              # CODEOWNERS file exists) and no commit has landed since, the PR is waiting on the
-              # author, not reviewers — drop it from the digest.
-              HAS_UNADDRESSED_CHANGES=$(echo "$PR" | jq -r \
-                --arg owners "$CODE_OWNERS" --arg lastCommit "$LAST_COMMIT_DATE" '
+              # Latest CHANGES_REQUESTED timestamp from a relevant reviewer (code owners when a
+              # CODEOWNERS file exists, otherwise any reviewer); empty when there is none.
+              CHANGES_REQUESTED_AT=$(echo "$PR" | jq -r --arg owners "$CODE_OWNERS" '
                 ($owners | split(" ") | map(select(length > 0))) as $owner_list |
                 [.latestReviews[]
                   | select(.state == "CHANGES_REQUESTED")
                   | select(($owner_list | length == 0)
                            or (.author.login as $l | $owner_list | contains([$l])))
-                  | select(.submittedAt >= $lastCommit)
-                ] | length > 0')
-              if [[ "$HAS_UNADDRESSED_CHANGES" == "true" ]]; then
-                continue
+                  | .submittedAt
+                ] | max // ""')
+
+              if [[ -n "$CHANGES_REQUESTED_AT" ]]; then
+                # Fetch commits for this single PR only. Requesting `commits` for every PR in the
+                # list query above blows GitHub's GraphQL node limit via the commit authors
+                # connection, so we look it up lazily and only when a change request exists.
+                LAST_COMMIT_DATE=$(gh pr view "$NUMBER" --repo "$REPO" --json commits \
+                  --jq '[.commits[].committedDate] | max // ""' 2>/dev/null || true)
+                # If the latest commit is not newer than the change request, the PR is waiting on
+                # the author, not reviewers — drop it. On a lookup failure (empty date) we keep
+                # the PR rather than hide it.
+                if [[ -n "$LAST_COMMIT_DATE" && ! "$LAST_COMMIT_DATE" > "$CHANGES_REQUESTED_AT" ]]; then
+                  continue
+                fi
               fi
 
               # ── Filter reviews to code owners only ──────────────────────
