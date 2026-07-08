@@ -12,6 +12,7 @@ jobs:
   digest:
     name: Post PR review digest to Slack
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       # ── Step 1: Authenticate as the GitHub App ─────────────────────────────
       # This action handles JWT generation and token exchange automatically.
@@ -83,14 +84,13 @@ jobs:
             [[ -z "$REPO" ]] && continue
             echo "Scanning: $REPO"
           
-            # latestReviews   = most recent review state per reviewer
             # mergeStateStatus= CLEAN means approved, checks pass, no conflicts
             # updatedAt       = last time the PR was updated (push, comment, review, etc.)
             PRS=$(gh pr list \
               --repo "$REPO" \
               --state open \
               --limit 100 \
-              --json number,title,url,author,createdAt,updatedAt,isDraft,latestReviews,mergeStateStatus,labels)
+              --json number,title,url,author,createdAt,updatedAt,isDraft,mergeStateStatus,labels)
           
             PR_COUNT=$(echo "$PRS" | jq 'length')
             REPO_TEXT=""
@@ -129,16 +129,34 @@ jobs:
               if [[ "$IS_INNER_SOURCE" == "true" && "$IS_INNER_SOURCE_DAY" == "false" ]]; then
                 continue
               fi
+
+              # ── Resolve each reviewer's latest decision ─────────────────
+              # The list query's latestReviews reports each reviewer's most recent review of ANY
+              # type, so a COMMENTED reply submitted after an approval hides that approval. Fetch
+              # the full review history and reduce to each reviewer's latest DECISIVE review
+              # (APPROVED / CHANGES_REQUESTED / DISMISSED), ignoring COMMENTED/PENDING. A dismissed
+              # approval correctly stops counting because DISMISSED can be a reviewer's latest
+              # decision. This mirrors how GitHub itself tracks approval state.
+              LATEST_DECISIONS=$(gh api --paginate "repos/$REPO/pulls/$NUMBER/reviews?per_page=100" 2>/dev/null \
+                | jq -s '
+                    (add // [])
+                    | [ .[]
+                        | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
+                        | {login: .user.login, state: .state, submittedAt: .submitted_at}
+                      ]
+                    | group_by(.login)
+                    | map(sort_by(.submittedAt) | last)
+                  ' || echo '[]')
           
               # ── Skip PRs with unaddressed change requests ───────────────
               # Latest CHANGES_REQUESTED timestamp from a relevant reviewer (code owners when a
               # CODEOWNERS file exists, otherwise any reviewer); empty when there is none.
-              CHANGES_REQUESTED_AT=$(echo "$PR" | jq -r --arg owners "$CODE_OWNERS" '
+              CHANGES_REQUESTED_AT=$(echo "$LATEST_DECISIONS" | jq -r --arg owners "$CODE_OWNERS" '
                 ($owners | split(" ") | map(select(length > 0))) as $owner_list |
-                [.latestReviews[]
+                [.[]
                   | select(.state == "CHANGES_REQUESTED")
                   | select(($owner_list | length == 0)
-                           or (.author.login as $l | $owner_list | contains([$l])))
+                           or (.login as $l | $owner_list | contains([$l])))
                   | .submittedAt
                 ] | max // ""')
 
@@ -156,27 +174,22 @@ jobs:
                 fi
               fi
 
-              # ── Filter reviews to code owners only ──────────────────────
-              if [[ -n "$CODE_OWNERS" ]]; then
-                REVIEW_COUNT=$(echo "$PR" | jq --arg owners "$CODE_OWNERS" '
-                  ($owners | split(" ") | map(select(length > 0))) as $owner_list |
-                  [.latestReviews[] |
-                    select(.state == "APPROVED") |
-                    select(.author.login as $l | $owner_list | contains([$l]))] | length
-                ')
-                APPROVERS=$(echo "$PR" | jq -r --arg owners "$CODE_OWNERS" '
-                  ($owners | split(" ") | map(select(length > 0))) as $owner_list |
-                  [.latestReviews[] |
-                    select(.state == "APPROVED") |
-                    select(.author.login as $l | $owner_list | contains([$l])) |
-                    .author.login] | join(", ")
-                ')
-              else
-                # No CODEOWNERS — count all approvals
-                REVIEW_COUNT=$(echo "$PR" | jq '[.latestReviews[] | select(.state == "APPROVED")] | length')
-                APPROVERS=$(echo "$PR" | jq -r \
-                  '[.latestReviews[] | select(.state == "APPROVED") | .author.login] | join(", ")')
-              fi
+              # ── Count code owner approvals (all approvals when no CODEOWNERS) ──
+              REVIEW_COUNT=$(echo "$LATEST_DECISIONS" | jq --arg owners "$CODE_OWNERS" '
+                ($owners | split(" ") | map(select(length > 0))) as $owner_list |
+                [.[]
+                  | select(.state == "APPROVED")
+                  | select(($owner_list | length == 0)
+                           or (.login as $l | $owner_list | contains([$l])))] | length
+              ')
+              APPROVERS=$(echo "$LATEST_DECISIONS" | jq -r --arg owners "$CODE_OWNERS" '
+                ($owners | split(" ") | map(select(length > 0))) as $owner_list |
+                [.[]
+                  | select(.state == "APPROVED")
+                  | select(($owner_list | length == 0)
+                           or (.login as $l | $owner_list | contains([$l])))
+                  | .login] | join(", ")
+              ')
           
               MERGE_STATE=$(echo "$PR" | jq -r '.mergeStateStatus')
           
