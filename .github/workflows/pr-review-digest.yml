@@ -124,7 +124,17 @@ jobs:
               # ── Check for inner source label (case-insensitive) ─────────
               IS_INNER_SOURCE=$(echo "$PR" | jq -r \
                 '[.labels[].name | ascii_downcase] | contains(["inner source"])')
-          
+
+              # ── Check for tech lead review required label (case-insensitive) ─
+              NEEDS_TECH_LEAD=$(echo "$PR" | jq -r \
+                '[.labels[].name | ascii_downcase] | contains(["tech lead review required"])')
+
+              # Inner source PRs still awaiting tech lead review aren't actionable
+              # by the broader team yet — hide them entirely, on any day.
+              if [[ "$IS_INNER_SOURCE" == "true" && "$NEEDS_TECH_LEAD" == "true" ]]; then
+                continue
+              fi
+
               # Skip inner source PRs on non-Tue/Thu days entirely
               if [[ "$IS_INNER_SOURCE" == "true" && "$IS_INNER_SOURCE_DAY" == "false" ]]; then
                 continue
@@ -236,7 +246,10 @@ jobs:
                 APPROVAL_STR=""
               fi
           
-              PR_LINE="• [#${NUMBER}: ${TITLE}](${URL}) — @${AUTHOR} · ${AGE_LABEL} old${NL}  ${REASON_STR}${LABEL_STR}${APPROVAL_STR}${NL}"
+              # Bare URL on its own line so Slack auto-links it cleanly. Wrapping it in
+              # Markdown [text](url) doesn't render in the Workflow Builder message (it shows
+              # literally) and pulls the trailing ")" into the auto-detected link.
+              PR_LINE="• #${NUMBER}: ${TITLE}${NL}  ${URL}${NL}  @${AUTHOR} · ${AGE_LABEL} old${NL}  ${REASON_STR}${LABEL_STR}${APPROVAL_STR}${NL}"
           
               # ── Route PR to the appropriate section ─────────────────────
               if [[ "$IS_INNER_SOURCE" == "true" ]]; then
