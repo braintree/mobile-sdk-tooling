@@ -48,15 +48,10 @@ jobs:
           TOTAL=0
           SLACK_BODY=""
           
-          # Inner source PR tracking (only included on Tuesdays and Thursdays)
+          # Inner source PR tracking (surfaced daily, routed to its own Slack section)
           INNER_SOURCE_TOTAL=0
           INNER_SOURCE_BODY=""
-          
-          # 1=Mon, 2=Tue, 3=Wed, 4=Thu, 5=Fri
-          DAY_OF_WEEK=$(date '+%u')
-          IS_INNER_SOURCE_DAY=false
-          [[ $DAY_OF_WEEK -eq 2 || $DAY_OF_WEEK -eq 4 ]] && IS_INNER_SOURCE_DAY=true
-          
+
           # ── Read code owners from this repo's CODEOWNERS file ─────────────
           # Extracts individual @username entries only — @org/team refs are skipped
           # since we're matching against individual reviewer logins on PRs.
@@ -90,7 +85,7 @@ jobs:
               --repo "$REPO" \
               --state open \
               --limit 100 \
-              --json number,title,url,author,createdAt,updatedAt,isDraft,mergeStateStatus,labels)
+              --json number,title,url,author,updatedAt,isDraft,mergeStateStatus,labels)
           
             PR_COUNT=$(echo "$PRS" | jq 'length')
             REPO_TEXT=""
@@ -107,20 +102,11 @@ jobs:
               TITLE=$(echo "$PR"   | jq -r '.title' | sed 's/[][|>]/ /g')
               URL=$(echo "$PR"     | jq -r '.url')
               AUTHOR=$(echo "$PR"  | jq -r '.author.login')
-              CREATED=$(echo "$PR" | jq -r '.createdAt')
               UPDATED=$(echo "$PR" | jq -r '.updatedAt')
-          
-              CREATED_EPOCH=$(date -d "$CREATED" +%s)
+
               UPDATED_EPOCH=$(date -d "$UPDATED" +%s)
-              AGE_HOURS=$(( (NOW - CREATED_EPOCH) / 3600 ))
               STALE_HOURS=$(( (NOW - UPDATED_EPOCH) / 3600 ))
-          
-              if [[ $AGE_HOURS -lt 24 ]]; then
-                AGE_LABEL="${AGE_HOURS}h"
-              else
-                AGE_LABEL="$((AGE_HOURS / 24))d"
-              fi
-          
+
               # ── Check for inner source label (case-insensitive) ─────────
               IS_INNER_SOURCE=$(echo "$PR" | jq -r \
                 '[.labels[].name | ascii_downcase] | contains(["inner source"])')
@@ -132,11 +118,6 @@ jobs:
               # Inner source PRs still awaiting tech lead review aren't actionable
               # by the broader team yet — hide them entirely, on any day.
               if [[ "$IS_INNER_SOURCE" == "true" && "$NEEDS_TECH_LEAD" == "true" ]]; then
-                continue
-              fi
-
-              # Skip inner source PRs on non-Tue/Thu days entirely
-              if [[ "$IS_INNER_SOURCE" == "true" && "$IS_INNER_SOURCE_DAY" == "false" ]]; then
                 continue
               fi
 
@@ -234,22 +215,22 @@ jobs:
               # Labels (display all labels except "inner source" which drives section routing)
               LABELS=$(echo "$PR" | jq -r '[.labels[].name] | join(", ")')
               if [[ -n "$LABELS" ]]; then
-                LABEL_STR="${NL}  🏷️  ${LABELS}"
+                LABEL_STR=" · 🏷️ ${LABELS}"
               else
                 LABEL_STR=""
               fi
-          
+
               # Approvers
               if [[ -n "$APPROVERS" ]]; then
-                APPROVAL_STR="${NL}  ✅ Approved by: $APPROVERS"
+                APPROVAL_STR=" · ✅ ${APPROVERS}"
               else
                 APPROVAL_STR=""
               fi
-          
-              # Bare URL on its own line so Slack auto-links it cleanly. Wrapping it in
-              # Markdown [text](url) doesn't render in the Workflow Builder message (it shows
-              # literally) and pulls the trailing ")" into the auto-detected link.
-              PR_LINE="• #${NUMBER}: ${TITLE}${NL}  ${URL}${NL}  @${AUTHOR} · ${AGE_LABEL} old${NL}  ${REASON_STR}${LABEL_STR}${APPROVAL_STR}${NL}"
+
+              # Bare URL (not Markdown [text](url) — that doesn't render in the Workflow Builder
+              # message, it shows literally and pulls the trailing ")" into the auto-detected
+              # link) so Slack still auto-links it even inline with the rest of the line.
+              PR_LINE="• #${NUMBER}: ${TITLE} — @${AUTHOR} — ${URL}${NL}  ${REASON_STR}${LABEL_STR}${APPROVAL_STR}${NL}"
           
               # ── Route PR to the appropriate section ─────────────────────
               if [[ "$IS_INNER_SOURCE" == "true" ]]; then
