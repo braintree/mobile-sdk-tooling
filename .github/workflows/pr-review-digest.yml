@@ -36,21 +36,21 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           # Stored as Actions Variables
           REPOS: ${{ vars.REPOS }}
-          OPEN_THRESHOLD_HOURS: ${{ vars.OPEN_THRESHOLD_HOURS }}
         run: |
           set -euo pipefail
           
-          THRESHOLD="${OPEN_THRESHOLD_HOURS:-12}"
-          NOW=$(date +%s)
           NL=$'\n'
-          
-          # Regular PR tracking
-          TOTAL=0
-          SLACK_BODY=""
-          
-          # Inner source PR tracking (surfaced daily, routed to its own Slack section)
-          INNER_SOURCE_TOTAL=0
-          INNER_SOURCE_BODY=""
+
+          # Each bucket collects "<createdAt>\t<line>" entries so they can be sorted
+          # oldest-to-newest (Slack's plain-text webhook message has no color coding).
+          ASSIGNED_TOTAL=0
+          ASSIGNED_ENTRIES=""
+
+          SECOND_TOTAL=0
+          SECOND_ENTRIES=""
+
+          MERGE_TOTAL=0
+          MERGE_ENTRIES=""
 
           # ── Read code owners from this repo's CODEOWNERS file ─────────────
           # Extracts individual @username entries only — @org/team refs are skipped
@@ -85,27 +85,21 @@ jobs:
               --repo "$REPO" \
               --state open \
               --limit 100 \
-              --json number,title,url,author,updatedAt,isDraft,mergeStateStatus,labels)
-          
+              --json number,title,url,createdAt,isDraft,mergeStateStatus,labels,reviewRequests)
+
             PR_COUNT=$(echo "$PRS" | jq 'length')
-            REPO_TEXT=""
-            INNER_SOURCE_REPO_TEXT=""
-          
+
             for i in $(seq 0 $((PR_COUNT - 1))); do
               PR=$(echo "$PRS" | jq ".[$i]")
-          
+
               # Skip draft PRs — not ready for review
               IS_DRAFT=$(echo "$PR" | jq -r '.isDraft')
               [[ "$IS_DRAFT" == "true" ]] && continue
-          
-              NUMBER=$(echo "$PR"  | jq -r '.number')
-              TITLE=$(echo "$PR"   | jq -r '.title' | sed 's/[][|>]/ /g')
-              URL=$(echo "$PR"     | jq -r '.url')
-              AUTHOR=$(echo "$PR"  | jq -r '.author.login')
-              UPDATED=$(echo "$PR" | jq -r '.updatedAt')
 
-              UPDATED_EPOCH=$(date -d "$UPDATED" +%s)
-              STALE_HOURS=$(( (NOW - UPDATED_EPOCH) / 3600 ))
+              NUMBER=$(echo "$PR"      | jq -r '.number')
+              TITLE=$(echo "$PR"       | jq -r '.title' | sed 's/[][|>]/ /g')
+              URL=$(echo "$PR"         | jq -r '.url')
+              CREATED_AT=$(echo "$PR"  | jq -r '.createdAt')
 
               # ── Check for inner source label (case-insensitive) ─────────
               IS_INNER_SOURCE=$(echo "$PR" | jq -r \
@@ -173,46 +167,25 @@ jobs:
                   | select(($owner_list | length == 0)
                            or (.login as $l | $owner_list | contains([$l])))] | length
               ')
-              APPROVERS=$(echo "$LATEST_DECISIONS" | jq -r --arg owners "$CODE_OWNERS" '
+
+              # First code-owner approver, by earliest submittedAt — the reviewer credited
+              # on the line once a PR has moved past "awaiting assigned reviewer".
+              FIRST_APPROVER=$(echo "$LATEST_DECISIONS" | jq -r --arg owners "$CODE_OWNERS" '
                 ($owners | split(" ") | map(select(length > 0))) as $owner_list |
                 [.[]
                   | select(.state == "APPROVED")
                   | select(($owner_list | length == 0)
-                           or (.login as $l | $owner_list | contains([$l])))
-                  | .login] | join(", ")
+                           or (.login as $l | $owner_list | contains([$l])))]
+                | sort_by(.submittedAt) | .[0].login // ""
               ')
-          
+
+              # Individually assigned reviewer (teams don't count — we need one login to tag)
+              ASSIGNED_REVIEWER=$(echo "$PR" | jq -r \
+                '[.reviewRequests[] | select(.__typename == "User") | .login] | .[0] // ""')
+
               MERGE_STATE=$(echo "$PR" | jq -r '.mergeStateStatus')
-          
-              REASONS=()
-          
-              # ── Criterion 1: fewer than 2 code owner approvals ─────────
-              if [[ $REVIEW_COUNT -lt 2 ]]; then
-                NEEDED=$(( 2 - REVIEW_COUNT ))
-                REASONS+=("${REVIEW_COUNT}/2 code owner approvals — needs ${NEEDED} more")
-              fi
-          
-              # ── Criterion 2: ready to merge ─────────────────────────────
-              if [[ "$MERGE_STATE" == "CLEAN" ]]; then
-                REASONS+=("ready to merge")
-              fi
-          
-              # ── Criterion 3: 2+ code owner approvals but stale ─────────
-              if [[ $REVIEW_COUNT -ge 2 && $STALE_HOURS -ge $THRESHOLD ]]; then
-                if [[ $STALE_HOURS -lt 24 ]]; then
-                  STALE_LABEL="${STALE_HOURS}h"
-                else
-                  STALE_LABEL="$((STALE_HOURS / 24))d"
-                fi
-                REASONS+=("${REVIEW_COUNT} code owner approvals but no activity for ${STALE_LABEL}")
-              fi
-          
-              [[ ${#REASONS[@]} -eq 0 ]] && continue
-          
-              REASON_STR=$(printf '%s; ' "${REASONS[@]}")
-              REASON_STR="${REASON_STR%; }"   # strip trailing semicolon
-          
-              # Labels (display all labels except "inner source" which drives section routing)
+
+              # Labels
               LABELS=$(echo "$PR" | jq -r '[.labels[].name] | join(", ")')
               if [[ -n "$LABELS" ]]; then
                 LABEL_STR=" · 🏷️ ${LABELS}"
@@ -220,58 +193,67 @@ jobs:
                 LABEL_STR=""
               fi
 
-              # Approvers
-              if [[ -n "$APPROVERS" ]]; then
-                APPROVAL_STR=" · ✅ ${APPROVERS}"
-              else
-                APPROVAL_STR=""
-              fi
-
+              # ── Route PR to the appropriate bucket ───────────────────────
               # Bare URL (not Markdown [text](url) — that doesn't render in the Workflow Builder
               # message, it shows literally and pulls the trailing ")" into the auto-detected
               # link) so Slack still auto-links it even inline with the rest of the line.
-              PR_LINE="• #${NUMBER}: ${TITLE} — @${AUTHOR} — ${URL}${NL}  ${REASON_STR}${LABEL_STR}${APPROVAL_STR}${NL}"
-          
-              # ── Route PR to the appropriate section ─────────────────────
-              if [[ "$IS_INNER_SOURCE" == "true" ]]; then
-                INNER_SOURCE_REPO_TEXT+="$PR_LINE"
-                ((INNER_SOURCE_TOTAL++)) || true
-              else
-                REPO_TEXT+="$PR_LINE"
-                ((TOTAL++)) || true
+              if [[ $REVIEW_COUNT -eq 0 ]]; then
+                [[ -z "$ASSIGNED_REVIEWER" ]] && continue
+                PR_LINE="• ${TITLE} — ${URL} — @${ASSIGNED_REVIEWER}${LABEL_STR}"
+                ASSIGNED_ENTRIES+="${CREATED_AT}$(printf '\t')${PR_LINE}${NL}"
+                ((ASSIGNED_TOTAL++)) || true
+              elif [[ $REVIEW_COUNT -eq 1 ]]; then
+                PR_LINE="• ${TITLE} — ${URL} — @${FIRST_APPROVER}${LABEL_STR}"
+                SECOND_ENTRIES+="${CREATED_AT}$(printf '\t')${PR_LINE}${NL}"
+                ((SECOND_TOTAL++)) || true
+              elif [[ "$MERGE_STATE" == "CLEAN" ]]; then
+                PR_LINE="• ${TITLE} — ${URL} — @${FIRST_APPROVER}${LABEL_STR}"
+                MERGE_ENTRIES+="${CREATED_AT}$(printf '\t')${PR_LINE}${NL}"
+                ((MERGE_TOTAL++)) || true
               fi
+              # 2+ approvals but not mergeable (conflicts/failing checks): blocked on
+              # something other than a reviewer, so it's left out of the digest.
             done
-          
-            if [[ -n "$REPO_TEXT" ]]; then
-              SLACK_BODY+="${REPO}${NL}${REPO_TEXT}${NL}"
-            fi
-            if [[ -n "$INNER_SOURCE_REPO_TEXT" ]]; then
-              INNER_SOURCE_BODY+="${REPO}${NL}${INNER_SOURCE_REPO_TEXT}${NL}"
-            fi
           done
-          
+
+          # Sort each bucket oldest-to-newest by createdAt, then strip the sort key.
+          sort_entries() {
+            [[ -z "$1" ]] && return
+            printf '%s' "$1" | sort | cut -f2-
+          }
+
+          ASSIGNED_BODY=$(sort_entries "$ASSIGNED_ENTRIES")
+          SECOND_BODY=$(sort_entries "$SECOND_ENTRIES")
+          MERGE_BODY=$(sort_entries "$MERGE_ENTRIES")
+
           # ── Build and send Slack message ──────────────────────────────────
           DATE_LABEL=$(date '+%A, %B %-d')
           SLACK_TEXT=""
-          
-          if [[ $TOTAL -gt 0 ]]; then
-            SLACK_TEXT+="🔍 PR Review Digest — ${DATE_LABEL}${NL}${TOTAL} PR(s) need attention:${NL}${NL}${SLACK_BODY}"
+
+          if [[ $ASSIGNED_TOTAL -gt 0 ]]; then
+            SLACK_TEXT+="🎯 Assigned Reviewer${NL}${ASSIGNED_BODY}${NL}"
           fi
-          
-          if [[ $INNER_SOURCE_TOTAL -gt 0 ]]; then
-            SLACK_TEXT+="${NL}🌐 Inner Source PRs — ${DATE_LABEL}${NL}${INNER_SOURCE_TOTAL} inner source PR(s) need attention:${NL}${NL}${INNER_SOURCE_BODY}"
+
+          if [[ $SECOND_TOTAL -gt 0 ]]; then
+            SLACK_TEXT+="👀 Ready for Second Review${NL}${SECOND_BODY}${NL}"
           fi
-          
-          if [[ -z "$SLACK_TEXT" ]]; then
+
+          if [[ $MERGE_TOTAL -gt 0 ]]; then
+            SLACK_TEXT+="✅ Ready to Merge${NL}${MERGE_BODY}${NL}"
+          fi
+
+          if [[ -n "$SLACK_TEXT" ]]; then
+            SLACK_TEXT="🔍 PR Review Digest — ${DATE_LABEL}${NL}${NL}${SLACK_TEXT}"
+          else
             SLACK_TEXT="✅ PR Review Digest — ${DATE_LABEL} — All clear! There are no PRs currently needing attention."
           fi
-          
+
           # Slack Workflow expects a variable named "message" in the payload.
           PAYLOAD=$(jq -n --arg message "$SLACK_TEXT" '{"message": $message}')
-          
+
           curl -sf -X POST \
             -H "Content-Type: application/json" \
             --data "$PAYLOAD" \
             "$SLACK_WEBHOOK_URL" > /dev/null
-          
-          echo "Done. Posted $TOTAL regular PR(s) and $INNER_SOURCE_TOTAL inner source PR(s) to Slack."
+
+          echo "Done. Posted ${ASSIGNED_TOTAL} assigned, ${SECOND_TOTAL} ready-for-second-review, ${MERGE_TOTAL} ready-to-merge PR(s) to Slack."
