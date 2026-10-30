@@ -79,8 +79,7 @@ jobs:
             [[ -z "$REPO" ]] && continue
             echo "Scanning: $REPO"
           
-            # mergeStateStatus= CLEAN means approved, checks pass, no conflicts
-            # updatedAt       = last time the PR was updated (push, comment, review, etc.)
+            # mergeStateStatus = CLEAN means approved, checks pass, no conflicts
             PRS=$(gh pr list \
               --repo "$REPO" \
               --state open \
