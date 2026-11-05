@@ -87,6 +87,7 @@ jobs:
               --json number,title,url,createdAt,isDraft,mergeStateStatus,labels,reviewRequests)
 
             PR_COUNT=$(echo "$PRS" | jq 'length')
+            [[ "$PR_COUNT" -eq 0 ]] && continue
 
             for i in $(seq 0 $((PR_COUNT - 1))); do
               PR=$(echo "$PRS" | jq ".[$i]")
@@ -178,9 +179,11 @@ jobs:
                 | sort_by(.submittedAt) | .[0].login // ""
               ')
 
-              # Individually assigned reviewer (teams don't count — we need one login to tag)
-              ASSIGNED_REVIEWER=$(echo "$PR" | jq -r \
-                '[.reviewRequests[] | select(.__typename == "User") | .login] | .[0] // ""')
+              # All individually assigned reviewers (teams don't count — we need logins to tag).
+              # A PR can have zero (nobody requested yet, or only a team was requested) — it still
+              # belongs in the digest, just without an @mention.
+              ASSIGNED_REVIEWERS=$(echo "$PR" | jq -r \
+                '[.reviewRequests[] | select(.__typename == "User") | .login] | join(" ")')
 
               MERGE_STATE=$(echo "$PR" | jq -r '.mergeStateStatus')
 
@@ -197,16 +200,20 @@ jobs:
               # message, it shows literally and pulls the trailing ")" into the auto-detected
               # link) so Slack still auto-links it even inline with the rest of the line.
               if [[ $REVIEW_COUNT -eq 0 ]]; then
-                [[ -z "$ASSIGNED_REVIEWER" ]] && continue
-                PR_LINE="• ${TITLE} — ${URL} — @${ASSIGNED_REVIEWER}${LABEL_STR}"
+                if [[ -n "$ASSIGNED_REVIEWERS" ]]; then
+                  REVIEWER_TAGS="@${ASSIGNED_REVIEWERS// /, @}"
+                  PR_LINE="• ${TITLE} — ${URL} — ${REVIEWER_TAGS}${LABEL_STR}"
+                else
+                  PR_LINE="• ${TITLE} — ${URL}${LABEL_STR}"
+                fi
                 ASSIGNED_ENTRIES+="${CREATED_AT}$(printf '\t')${PR_LINE}${NL}"
                 ((ASSIGNED_TOTAL++)) || true
               elif [[ $REVIEW_COUNT -eq 1 ]]; then
-                PR_LINE="• ${TITLE} — ${URL} — @${FIRST_APPROVER}${LABEL_STR}"
+                PR_LINE="• ${TITLE} — ${URL} — Already reviewed by: @${FIRST_APPROVER}${LABEL_STR}"
                 SECOND_ENTRIES+="${CREATED_AT}$(printf '\t')${PR_LINE}${NL}"
                 ((SECOND_TOTAL++)) || true
               elif [[ "$MERGE_STATE" == "CLEAN" ]]; then
-                PR_LINE="• ${TITLE} — ${URL} — @${FIRST_APPROVER}${LABEL_STR}"
+                PR_LINE="• ${TITLE} — ${URL}${LABEL_STR}"
                 MERGE_ENTRIES+="${CREATED_AT}$(printf '\t')${PR_LINE}${NL}"
                 ((MERGE_TOTAL++)) || true
               fi
